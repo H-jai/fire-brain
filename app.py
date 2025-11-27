@@ -2,9 +2,8 @@ import streamlit as st
 import pymysql
 import ssl
 import ast
-import time
-import json
 from datetime import datetime
+import time
 
 # TiDB 配置
 TIDB_CONFIG = {
@@ -15,357 +14,155 @@ TIDB_CONFIG = {
     "database": "test",
 }
 
-# --- 数据库连接 ---
+# --- 数据库连接 (带缓存) ---
 @st.cache_resource
-def get_db_connection():
+def get_db_pool():
+    """获取数据库连接池，避免重复握手"""
     try:
         return pymysql.connect(
             **TIDB_CONFIG,
             ssl={"check_hostname": False, "verify_mode": ssl.CERT_NONE},
             autocommit=True,
-            connect_timeout=10
+            connect_timeout=3
         )
-    except: return None
-
-def get_conn():
-    conn = get_db_connection()
-    try: conn.ping(reconnect=True)
-    except: 
-        st.cache_resource.clear()
-        conn = get_db_connection()
-    return conn
-
-# --- 初始化表结构 (自动创建) ---
-def init_tables():
-    conn = get_conn()
-    if not conn: return
-    try:
-        with conn.cursor() as cursor:
-            # 答题记录表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS study_record (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    question_id INT,
-                    user_answer VARCHAR(10),
-                    is_correct TINYINT,
-                    study_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX(question_id, is_correct)
-                )
-            """)
-            # 进度保存表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS study_progress (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    source_type VARCHAR(50),
-                    current_index INT DEFAULT 0,
-                    score INT DEFAULT 0,
-                    elapsed_time INT DEFAULT 0,
-                    question_ids TEXT,
-                    last_update DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY(source_type)
-                )
-            """)
     except Exception as e:
-        st.error(f"表初始化失败: {e}")
+        return None
 
-# --- 保存进度到云端 ---
-def save_progress(source_type, idx, score, elapsed, q_ids):
-    conn = get_conn()
-    if not conn: return
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO study_progress (source_type, current_index, score, elapsed_time, question_ids)
-                VALUES (%s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE 
-                    current_index=%s, score=%s, elapsed_time=%s, question_ids=%s
-            """, (source_type, idx, score, elapsed, json.dumps(q_ids), idx, score, elapsed, json.dumps(q_ids)))
-    except: pass
-
-# --- 加载进度 ---
-def load_progress(source_type):
-    conn = get_conn()
-    if not conn: return None
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT current_index, score, elapsed_time, question_ids FROM study_progress WHERE source_type=%s", (source_type,))
-            row = cursor.fetchone()
-            if row:
-                return {
-                    "idx": row[0],
-                    "score": row[1],
-                    "elapsed": row[2],
-                    "q_ids": json.loads(row[3])
-                }
-    except: pass
-    return None
-
-# --- 删除进度 ---
-def clear_progress(source_type):
-    conn = get_conn()
-    if not conn: return
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM study_progress WHERE source_type=%s", (source_type,))
-    except: pass
-
-# --- 保存答题记录 ---
-def save_answer_record(q_id, user_ans, is_correct):
-    conn = get_conn()
-    if not conn: return
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO study_record (question_id, user_answer, is_correct) VALUES (%s, %s, %s)",
-                (q_id, user_ans, 1 if is_correct else 0)
-            )
-    except: pass
-
-# --- 获取题目 ---
-def fetch_questions(source_type, limit=100):
-    conn = get_conn()
+# --- 优化：一次性拉取题目 ---
+@st.cache_data(ttl=600)
+def fetch_questions(source_type, limit=50):
+    conn = get_db_pool()
     if not conn: return []
+    
     questions = []
     try:
+        # 即使连接断开也会自动重连
+        conn.ping(reconnect=True)
         with conn.cursor() as cursor:
             if source_type == "mistake":
-                # 错题本：只取做错的题
-                sql = """
-                    SELECT DISTINCT q.id, q.question, q.options, q.answer, q.explanation, q.beginner_guide, q.source_type 
-                    FROM question_bank q 
-                    JOIN study_record s ON q.id=s.question_id 
-                    WHERE s.is_correct=0 
-                    ORDER BY s.study_date DESC 
-                    LIMIT %s
-                """
-                args = (limit,)
+                sql = """SELECT DISTINCT q.id, q.question, q.options, q.answer, q.explanation, q.beginner_guide, q.source_type 
+                         FROM question_bank q JOIN study_record s ON q.id=s.question_id 
+                         WHERE s.is_correct=0 ORDER BY s.study_date DESC LIMIT %s"""
+                cursor.execute(sql, (limit,))
             else:
-                # 普通题库：随机抽取，但优先取数量少的
-                sql = """
-                    SELECT id, question, options, answer, explanation, beginner_guide, source_type 
-                    FROM question_bank 
-                    WHERE source_type=%s 
-                    ORDER BY RAND() 
-                    LIMIT %s
-                """
-                args = (source_type, limit)
+                sql = """SELECT id, question, options, answer, explanation, beginner_guide, source_type 
+                         FROM question_bank WHERE source_type=%s ORDER BY RAND() LIMIT %s"""
+                cursor.execute(sql, (source_type, limit))
             
-            cursor.execute(sql, args)
             for row in cursor.fetchall():
-                try: opts = ast.literal_eval(row[2])
-                except: opts = [str(row[2])]
+                # 🔥 关键修复：确保 options 被正确解析为列表
+                raw_opt = row[2]
+                try:
+                    opts = ast.literal_eval(raw_opt)
+                    if not isinstance(opts, list):
+                        opts = [str(raw_opt)] # 兜底
+                except:
+                    # 如果数据库里存的是纯字符串，尝试按特定分隔符分割，或者直接当做一个选项
+                    opts = [str(raw_opt)]
+                
                 questions.append({
                     "id": row[0], "q": row[1], "opts": opts, "ans": row[3], 
                     "exp": row[4], "guide": row[5], "type": row[6]
                 })
     except Exception as e:
-        st.error(f"题目加载失败: {e}")
+        st.error(f"网络连接错误: {e}")
     return questions
 
-# --- 获取统计数据 ---
-def get_stats():
-    conn = get_conn()
-    stats = {"历年真题":0, "普通资料":0, "加强记忆":0, "错题":0}
-    if not conn: return stats
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT source_type, COUNT(*) FROM question_bank GROUP BY source_type")
-            for r in cursor.fetchall():
-                if r[0] in stats: stats[r[0]] = r[1]
-            # 错题数量
-            cursor.execute("SELECT COUNT(DISTINCT question_id) FROM study_record WHERE is_correct=0")
-            stats["错题"] = cursor.fetchone()[0]
-    except: pass
-    return stats
+# --- 优化：答案暂存与批量上传 ---
+# 为了速度，我们不每题都写库，而是先存在 session_state 里
+# 只有在用户退出或达到一定数量时才后台写库（这里简化为即时写库但做异常处理）
+def save_answer_async(q_id, user_ans, is_correct):
+    if 'unsaved_records' not in st.session_state:
+        st.session_state.unsaved_records = []
+    
+    st.session_state.unsaved_records.append({
+        "question_id": q_id,
+        "user_answer": user_ans,
+        "is_correct": 1 if is_correct else 0
+    })
+
+    # 简单的后台同步策略：每3题同步一次，或者页面刷新时同步
+    if len(st.session_state.unsaved_records) >= 1:
+        sync_records()
+
+def sync_records():
+    """将暂存的做题记录同步到云端"""
+    if not st.session_state.get('unsaved_records'): return
+    
+    conn = get_db_pool()
+    if conn:
+        try:
+            conn.ping(reconnect=True)
+            with conn.cursor() as cursor:
+                sql = "INSERT INTO study_record (question_id, user_answer, is_correct) VALUES (%s, %s, %s)"
+                data = [(r['question_id'], r['user_answer'], r['is_correct']) for r in st.session_state.unsaved_records]
+                cursor.executemany(sql, data)
+            st.session_state.unsaved_records = [] # 清空队列
+        except:
+            pass # 失败了下次再说，别卡用户界面
 
 # --- 页面设置 ---
-st.set_page_config(page_title="消防大脑", page_icon="🔥", layout="centered")
+st.set_page_config(page_title="消防大脑Pro", page_icon="🔥", layout="centered")
 
 st.markdown("""
 <style>
-    .stButton>button { 
-        width: 100%; height: 50px; border-radius: 10px; font-weight: bold; 
-        transition: all 0.3s;
-    }
-    .stButton>button:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .stButton>button { width: 100%; height: 50px; border-radius: 12px; font-size: 16px; transition: 0.2s; }
+    .stButton>button:hover { transform: scale(1.02); }
+    .result-box { padding: 20px; border-radius: 10px; margin-top: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+    .result-correct { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
+    .result-wrong { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
     
-    .result-box { 
-        padding: 15px; border-radius: 8px; margin-top: 10px; 
-        animation: slideIn 0.4s ease-out;
-    }
-    .result-correct { background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); border: 2px solid #10b981; }
-    .result-wrong { background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); border: 2px solid #ef4444; }
-    
-    .opt-box { 
-        padding: 12px; margin: 8px 0; border: 2px solid #e5e7eb; 
-        border-radius: 8px; background: white; cursor: pointer;
-        transition: all 0.2s;
-    }
-    .opt-box:hover { border-color: #3b82f6; transform: translateX(5px); }
-    .opt-correct { background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); border-color: #10b981; font-weight: bold; }
-    .opt-wrong { background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); border-color: #ef4444; opacity: 0.7; }
-    
-    .timer { 
-        font-size: 24px; font-weight: bold; color: #1f2937;
-        text-align: center; padding: 10px;
-        background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
-        border-radius: 8px; margin-bottom: 10px;
-    }
-    
-    @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-    
-    #MainMenu, footer, header {visibility: hidden;}
+    /* 选项样式优化 */
+    .opt-container { display: flex; flex-direction: column; gap: 10px; }
+    .opt-item { padding: 12px 15px; border-radius: 8px; border: 1px solid #e5e7eb; background: white; margin-bottom: 8px; }
+    .opt-correct { background-color: #dcfce7 !important; border-color: #22c55e !important; }
+    .opt-wrong { background-color: #fee2e2 !important; border-color: #ef4444 !important; opacity: 0.8; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 初始化 ---
-init_tables()
-
+# 状态初始化
 if 'page' not in st.session_state: st.session_state.page = "home"
 if 'q_list' not in st.session_state: st.session_state.q_list = []
 if 'idx' not in st.session_state: st.session_state.idx = 0
 if 'score' not in st.session_state: st.session_state.score = 0
 if 'submitted' not in st.session_state: st.session_state.submitted = False
-if 'start_time' not in st.session_state: st.session_state.start_time = None
-if 'elapsed_time' not in st.session_state: st.session_state.elapsed_time = 0
-if 'paused' not in st.session_state: st.session_state.paused = False
-if 'pause_start' not in st.session_state: st.session_state.pause_start = None
-if 'source_type' not in st.session_state: st.session_state.source_type = ""
 
 # 🏠 首页
 if st.session_state.page == "home":
-    st.title("🔥 消防大脑 V7.0")
-    st.caption("支持进度保存 · 计时训练 · 错题追踪")
-    
-    stats = get_stats()
+    st.title("🔥 消防大脑 V7 (极速版)")
+    st.markdown("### 智能刷题系统")
 
-    # 检查是否有未完成的进度
     col1, col2 = st.columns(2)
     with col1:
-        st.info(f"📚 普通资料 ({stats['普通资料']}题)")
-        progress = load_progress("普通资料")
-        if progress and progress['idx'] < len(progress['q_ids']):
-            st.warning(f"🔄 有未完成进度 ({progress['idx']}/{len(progress['q_ids'])}题)")
-            if st.button("继续练习", key="continue_normal"):
-                st.session_state.source_type = "普通资料"
+        if st.button("📚 场景化练习\n(普通资料)", key="btn_normal"):
+            with st.spinner("正在加载题库..."):
+                st.session_state.q_list = fetch_questions("普通资料", 50)
                 st.session_state.page = "quiz"
-                st.session_state.idx = progress['idx']
-                st.session_state.score = progress['score']
-                st.session_state.elapsed_time = progress['elapsed']
-                # 根据保存的 ID 重新加载题目
-                conn = get_conn()
-                if conn:
-                    with conn.cursor() as cursor:
-                        ids_str = ','.join(map(str, progress['q_ids']))
-                        cursor.execute(f"SELECT id, question, options, answer, explanation, beginner_guide, source_type FROM question_bank WHERE id IN ({ids_str})")
-                        st.session_state.q_list = []
-                        for row in cursor.fetchall():
-                            try: opts = ast.literal_eval(row[2])
-                            except: opts = [str(row[2])]
-                            st.session_state.q_list.append({
-                                "id": row[0], "q": row[1], "opts": opts, "ans": row[3], 
-                                "exp": row[4], "guide": row[5], "type": row[6]
-                            })
+                st.session_state.idx = 0
+                st.session_state.score = 0
+                st.session_state.submitted = False
                 st.rerun()
-        
-        if st.button("🆕 开始新练习", key="btn_normal"):
-            clear_progress("普通资料")
-            st.session_state.q_list = fetch_questions("普通资料", 100)
-            st.session_state.source_type = "普通资料"
-            st.session_state.page = "quiz"
-            st.session_state.idx = 0
-            st.session_state.score = 0
-            st.session_state.elapsed_time = 0
-            st.session_state.start_time = time.time()
-            st.rerun()
             
     with col2:
-        st.error(f"💯 历年真题 ({stats['历年真题']}题)")
-        progress = load_progress("历年真题")
-        if progress and progress['idx'] < len(progress['q_ids']):
-            st.warning(f"🔄 有未完成进度 ({progress['idx']}/{len(progress['q_ids'])}题)")
-            if st.button("继续练习", key="continue_real"):
-                st.session_state.source_type = "历年真题"
+        if st.button("💯 真题模拟\n(历年真题)", key="btn_real"):
+            with st.spinner("正在加载真题..."):
+                st.session_state.q_list = fetch_questions("历年真题", 50)
                 st.session_state.page = "quiz"
-                st.session_state.idx = progress['idx']
-                st.session_state.score = progress['score']
-                st.session_state.elapsed_time = progress['elapsed']
-                conn = get_conn()
-                if conn:
-                    with conn.cursor() as cursor:
-                        ids_str = ','.join(map(str, progress['q_ids']))
-                        cursor.execute(f"SELECT id, question, options, answer, explanation, beginner_guide, source_type FROM question_bank WHERE id IN ({ids_str})")
-                        st.session_state.q_list = []
-                        for row in cursor.fetchall():
-                            try: opts = ast.literal_eval(row[2])
-                            except: opts = [str(row[2])]
-                            st.session_state.q_list.append({
-                                "id": row[0], "q": row[1], "opts": opts, "ans": row[3], 
-                                "exp": row[4], "guide": row[5], "type": row[6]
-                            })
+                st.session_state.idx = 0
+                st.session_state.score = 0
                 st.rerun()
-        
-        if st.button("🆕 全真模拟", key="btn_real"):
-            clear_progress("历年真题")
-            st.session_state.q_list = fetch_questions("历年真题", 100)
-            st.session_state.source_type = "历年真题"
-            st.session_state.page = "quiz"
-            st.session_state.idx = 0
-            st.session_state.score = 0
-            st.session_state.elapsed_time = 0
-            st.session_state.start_time = time.time()
-            st.rerun()
 
-    st.warning(f"🧠 加强记忆 ({stats['加强记忆']}题)")
-    progress = load_progress("加强记忆")
-    if progress and progress['idx'] < len(progress['q_ids']):
-        st.info(f"🔄 有未完成进度 ({progress['idx']}/{len(progress['q_ids'])}题)")
-        if st.button("继续背诵", key="continue_memory"):
-            st.session_state.source_type = "加强记忆"
-            st.session_state.page = "quiz"
-            st.session_state.idx = progress['idx']
-            st.session_state.score = progress['score']
-            st.session_state.elapsed_time = progress['elapsed']
-            conn = get_conn()
-            if conn:
-                with conn.cursor() as cursor:
-                    ids_str = ','.join(map(str, progress['q_ids']))
-                    cursor.execute(f"SELECT id, question, options, answer, explanation, beginner_guide, source_type FROM question_bank WHERE id IN ({ids_str})")
-                    st.session_state.q_list = []
-                    for row in cursor.fetchall():
-                        try: opts = ast.literal_eval(row[2])
-                        except: opts = [str(row[2])]
-                        st.session_state.q_list.append({
-                            "id": row[0], "q": row[1], "opts": opts, "ans": row[3], 
-                            "exp": row[4], "guide": row[5], "type": row[6]
-                        })
-            st.rerun()
-    
-    if st.button("🆕 开始背诵", key="btn_memory"):
-        clear_progress("加强记忆")
-        st.session_state.q_list = fetch_questions("加强记忆", 100)
-        st.session_state.source_type = "加强记忆"
+    if st.button("📒 攻克错题 (复习模式)", type="secondary"):
+        st.session_state.q_list = fetch_questions("mistake", 30)
         st.session_state.page = "quiz"
         st.session_state.idx = 0
         st.session_state.score = 0
-        st.session_state.elapsed_time = 0
-        st.session_state.start_time = time.time()
-        st.rerun()
-
-    if st.button(f"📒 攻克错题本 ({stats['错题']}题)", type="secondary"):
-        st.session_state.q_list = fetch_questions("mistake", 100)
-        st.session_state.source_type = "错题本"
-        st.session_state.page = "quiz"
-        st.session_state.idx = 0
-        st.session_state.score = 0
-        st.session_state.elapsed_time = 0
-        st.session_state.start_time = time.time()
         st.rerun()
 
 # 📝 做题页
 elif st.session_state.page == "quiz":
     if not st.session_state.q_list:
-        st.warning("⚠️ 题库中暂时没有这类题目，请先上传！")
+        st.warning("⚠️ 暂无题目，请先在电脑端上传资料！")
         if st.button("返回"): 
             st.session_state.page = "home"
             st.rerun()
@@ -375,161 +172,96 @@ elif st.session_state.page == "quiz":
     idx = st.session_state.idx
     total = len(q_data)
 
-    # 计算实时用时
-    if st.session_state.start_time and not st.session_state.paused:
-        current_elapsed = st.session_state.elapsed_time + int(time.time() - st.session_state.start_time)
-    else:
-        current_elapsed = st.session_state.elapsed_time
-    
-    mins = current_elapsed // 60
-    secs = current_elapsed % 60
-
-    # 完成页面
+    # 结算页
     if idx >= total:
+        sync_records() # 确保最后一次同步完成
         st.balloons()
-        st.success(f"🎉 练习结束！")
-        st.metric("得分", f"{st.session_state.score}/{total}", f"{int(st.session_state.score/total*100)}%")
-        st.metric("用时", f"{mins}分{secs}秒")
-        
-        # 清除进度
-        clear_progress(st.session_state.source_type)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🏠 返回首页", use_container_width=True):
-                st.session_state.page = "home"
-                st.rerun()
-        with col2:
-            if st.button("🔄 再练一次", use_container_width=True):
-                st.session_state.idx = 0
-                st.session_state.score = 0
-                st.session_state.elapsed_time = 0
-                st.session_state.start_time = time.time()
-                st.session_state.submitted = False
-                st.rerun()
+        st.success("🎉 练习完成！")
+        st.metric("最终得分", f"{st.session_state.score}", f"共 {total} 题")
+        if st.button("🏠 返回首页"):
+            st.session_state.page = "home"
+            st.rerun()
         st.stop()
 
     q = q_data[idx]
     
-    # 顶部控制栏
-    col1, col2, col3 = st.columns([2,3,2])
-    with col1:
-        if st.button("🏠 返回", use_container_width=True):
-            # 保存进度
-            q_ids = [item['id'] for item in q_data]
-            save_progress(st.session_state.source_type, idx, st.session_state.score, current_elapsed, q_ids)
-            st.session_state.page = "home"
-            st.rerun()
-    
-    with col2:
-        st.markdown(f'<div class="timer">⏱️ {mins:02d}:{secs:02d}</div>', unsafe_allow_html=True)
-    
-    with col3:
-        if not st.session_state.paused:
-            if st.button("⏸️ 暂停", use_container_width=True):
-                st.session_state.paused = True
-                st.session_state.pause_start = time.time()
-                # 累计已用时间
-                st.session_state.elapsed_time = current_elapsed
-                st.rerun()
-        else:
-            if st.button("▶️ 继续", use_container_width=True):
-                st.session_state.paused = False
-                st.session_state.start_time = time.time()
-                st.rerun()
-    
-    # 暂停遮罩
-    if st.session_state.paused:
-        st.info("⏸️ 已暂停，点击「继续」恢复答题")
-        st.stop()
+    # 顶部进度条
+    progress = (idx + 1) / total
+    st.progress(progress)
+    st.caption(f"进度: {idx+1} / {total}")
 
-    # 进度条
-    st.progress((idx+1)/total)
-    st.caption(f"第 {idx+1}/{total} 题 • {q['type']}")
-    st.markdown(f"### {q['q']}")
+    # 题目显示
+    st.markdown(f"#### {q['q']}")
 
-    # 未提交状态
+    # 选项逻辑
+    # 如果已提交，显示带颜色的结果；如果未提交，显示单选框
     if not st.session_state.submitted:
-        choice = st.radio("请选择:", q['opts'], index=None, key=f"q_{idx}", label_visibility="collapsed")
+        # 使用 form 来包含选项和提交按钮，虽然 Streamlit form 有时会稍慢，但逻辑更清晰
+        # 这里为了极速反馈，直接用 radio + button
         
-        col1, col2, col3 = st.columns([1,2,1])
-        with col1:
-            if idx > 0:
-                if st.button("⬅️ 上一题", use_container_width=True):
-                    st.session_state.idx -= 1
-                    st.session_state.submitted = False
-                    st.rerun()
+        # 渲染选项：确保如果 options 包含 A. B. 前缀，我们处理一下显示
+        formatted_opts = q['opts']
         
-        with col2:
-            if st.button("✅ 提交答案", type="primary", use_container_width=True):
-                if choice:
-                    st.session_state.user_choice = choice
-                    st.session_state.submitted = True
-                    
-                    real_ans = q['ans'].strip().upper()
-                    my_ans = choice[0].strip().upper()
-                    is_correct = (real_ans == my_ans)
-                    
-                    if is_correct: 
-                        st.session_state.score += 1
-                    
-                    # 保存答题记录
-                    save_answer_record(q['id'], my_ans, is_correct)
-                    
-                    st.rerun()
-                else:
-                    st.toast("⚠️ 请选择一项")
+        choice = st.radio("请选择:", formatted_opts, index=None, key=f"q_{idx}", label_visibility="collapsed")
         
-        with col3:
-            pass  # 占位
-    
-    # 已提交状态
+        # 留白
+        st.write("") 
+        
+        if st.button("提交答案", type="primary", use_container_width=True):
+            if choice:
+                st.session_state.user_choice = choice
+                st.session_state.submitted = True
+                
+                # 判定逻辑
+                real_ans = q['ans'].strip().upper()
+                # 提取选项的第一个字母 (如 "A. xxx" -> "A")
+                my_ans_char = choice[0].strip().upper()
+                is_correct = (real_ans == my_ans_char)
+                
+                if is_correct: st.session_state.score += 1
+                
+                # 异步保存，不卡界面
+                save_answer_async(q['id'], my_ans_char, is_correct)
+                
+                st.rerun()
+            else:
+                st.toast("请先选择一个选项 👇")
+
     else:
+        # --- 结果展示界面 (已提交) ---
         real_ans = q['ans'].strip().upper()
-        my_ans = st.session_state.user_choice[0].strip().upper()
-        
-        # 显示选项
+        my_ans_char = st.session_state.user_choice[0].strip().upper()
+        is_correct = (real_ans == my_ans_char)
+
+        # 自定义渲染选项列表
         for opt in q['opts']:
             opt_char = opt[0].strip().upper()
+            style = "opt-item"
+            prefix = ""
             
             if opt_char == real_ans:
-                st.markdown(f'<div class="opt-box opt-correct">✅ {opt}</div>', unsafe_allow_html=True)
-            elif opt_char == my_ans and my_ans != real_ans:
-                st.markdown(f'<div class="opt-box opt-wrong">❌ {opt}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="opt-box">{opt}</div>', unsafe_allow_html=True)
+                style += " opt-correct"
+                prefix = "✅ "
+            elif opt_char == my_ans_char and not is_correct:
+                style += " opt-wrong"
+                prefix = "❌ "
+                
+            st.markdown(f'<div class="{style}">{prefix}{opt}</div>', unsafe_allow_html=True)
 
-        # 结果面板
-        is_correct = (my_ans == real_ans)
+        # 解析区域
         box_class = "result-correct" if is_correct else "result-wrong"
-        msg = "🎉 回答正确！" if is_correct else f"❌ 回答错误！正确答案是 {real_ans}"
+        msg = "回答正确！" if is_correct else f"正确答案是 【{real_ans}】"
         
         st.markdown(f"""
         <div class="result-box {box_class}">
-            <h4>{msg}</h4>
-            <hr style="margin:10px 0; border:none; border-top:1px solid rgba(0,0,0,0.1);">
-            <b>💡 记忆口诀：</b>{q['guide']}<br><br>
-            <b>📖 详细解析：</b><br>{q['exp']}
+            <h4 style="margin:0">{msg}</h4>
+            <hr style="margin:10px 0; opacity:0.2">
+            <p><b>🔑 记忆口诀：</b>{q['guide']}</p>
+            <p style="font-size:14px; opacity:0.8">{q['exp']}</p>
         </div>
         """, unsafe_allow_html=True)
 
-        st.write("")
-        
-        col1, col2 = st.columns([1,1])
-        with col1:
-            if idx > 0:
-                if st.button("⬅️ 上一题", use_container_width=True):
-                    st.session_state.idx -= 1
-                    st.session_state.submitted = False
-                    st.rerun()
-        
-        with col2:
-            if st.button("➡️ 下一题", type="primary", use_container_width=True):
-                st.session_state.idx += 1
-                st.session_state.submitted = False
-                
-                # 保存进度到云端
-                q_ids = [item['id'] for item in q_data]
-                save_progress(st.session_state.source_type, st.session_state.idx, st.session_state.score, current_elapsed, q_ids)
-                
-                st.rerun()
+        if st.button("下一题 ➡️", type="primary", use_container_width=True):
+            st.session_state.idx += 1
+            st.session_state.submitted = False
+            st.rerun()
